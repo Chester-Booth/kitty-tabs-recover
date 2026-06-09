@@ -1,0 +1,20 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "kitty-tabs-recover"
+version = "0.1.0"
+description = "Autosave and reopen multi-tab kitty workspaces."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [{ name = "blox" }]
+dependencies = []
+
+[project.scripts]
+ktr = "kitty_tabs_recover.cli:main"
+reopen = "kitty_tabs_recover.cli:reopen_main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/kitty_tabs_recover"]

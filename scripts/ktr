@@ -1,0 +1,6 @@
+#!/usr/bin/env sh
+set -eu
+
+script_path=$(readlink -f -- "$0")
+repo_dir=$(CDPATH= cd -- "$(dirname -- "$script_path")/.." && pwd)
+PYTHONPATH="$repo_dir/src${PYTHONPATH:+:$PYTHONPATH}" exec python3 -m kitty_tabs_recover.cli "$@"

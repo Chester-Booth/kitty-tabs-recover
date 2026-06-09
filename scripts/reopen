@@ -1,0 +1,6 @@
+#!/usr/bin/env sh
+set -eu
+
+script_path=$(readlink -f -- "$0")
+repo_dir=$(CDPATH= cd -- "$(dirname -- "$script_path")/.." && pwd)
+PYTHONPATH="$repo_dir/src${PYTHONPATH:+:$PYTHONPATH}" exec python3 -c 'import sys; from kitty_tabs_recover.cli import reopen_main; raise SystemExit(reopen_main(sys.argv[1:]))' "$@"

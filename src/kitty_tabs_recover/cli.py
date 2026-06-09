@@ -1,0 +1,345 @@
+from __future__ import annotations
+
+import argparse
+import difflib
+import hashlib
+import json
+import sys
+import time
+from pathlib import Path
+
+from . import hyprland, kitty, popup, session, tui
+from .commands import CommandError
+from .names import slugify, timestamp
+from .snapshot import (
+    StoredSnapshot,
+    choose_focused_os_window,
+    current_workspace_key,
+    delete_snapshot,
+    load_snapshots,
+    prune_autosaves,
+    rename_snapshot,
+    save_os_window,
+    tab_count,
+    window_title,
+)
+
+
+def _print_error(exc: Exception) -> int:
+    print(f"ktr: {exc}", file=sys.stderr)
+    return 1
+
+
+def _workspace_summary(item: StoredSnapshot) -> str:
+    data = item.data
+    tabs = data.get("os_window", {}).get("tabs") or []
+    title = data.get("os_window", {}).get("title") or item.name
+    updated = data.get("updated_at") or "unknown"
+    return f"{item.name:24} {item.kind:8} {len(tabs):2d} tabs  {updated}  {title}"
+
+
+def cmd_list(args: argparse.Namespace) -> int:
+    for item in load_snapshots(include_autosaves=args.autosaves):
+        print(_workspace_summary(item))
+    return 0
+
+
+def _save_one(os_window: dict, name: str, *, kind: str, scrollback: bool) -> Path:
+    return save_os_window(os_window, name, kind=kind, capture_scrollback=scrollback)
+
+
+def cmd_save(args: argparse.Namespace) -> int:
+    os_windows = kitty.ls()
+    if args.all:
+        for os_window in os_windows:
+            if tab_count(os_window) < 1:
+                continue
+            name = args.name or window_title(os_window)
+            if len(os_windows) > 1:
+                name = f"{name}-{os_window.get('id')}"
+            path = _save_one(os_window, name, kind="named", scrollback=not args.no_scrollback)
+            print(path)
+        return 0
+
+    os_window = choose_focused_os_window(os_windows, hyprland.active_window())
+    if not os_window:
+        raise CommandError("Could not identify the focused kitty OS window")
+    name = args.name or window_title(os_window)
+    print(_save_one(os_window, name, kind="named", scrollback=not args.no_scrollback))
+    return 0
+
+
+def _match_snapshot(query: str, *, include_autosaves: bool = True) -> StoredSnapshot | None:
+    snapshots = load_snapshots(include_autosaves=include_autosaves)
+    named = [item for item in snapshots if include_autosaves or item.kind == "named"]
+    if not named:
+        return None
+
+    query_slug = slugify(query)
+    for item in named:
+        if item.name == query or slugify(item.name) == query_slug:
+            return item
+
+    prefix = [item for item in named if slugify(item.name).startswith(query_slug)]
+    if len(prefix) == 1:
+        return prefix[0]
+
+    names = [item.name for item in named]
+    matches = difflib.get_close_matches(query, names, n=2, cutoff=0.45)
+    if len(matches) == 1:
+        return next(item for item in named if item.name == matches[0])
+    return None
+
+
+def _pick_snapshot(include_autosaves: bool) -> StoredSnapshot | None:
+    snapshots = load_snapshots(include_autosaves=include_autosaves)
+    if not snapshots:
+        return None
+    while True:
+        result = tui.pick_snapshot(snapshots, current_key=current_workspace_key())
+        if result.action == "open":
+            return result.item
+        if result.action == "cancel":
+            return None
+        if result.action == "rename" and result.item and result.value:
+            try:
+                renamed = rename_snapshot(result.item, result.value)
+            except CommandError as exc:
+                print(f"rename failed: {exc}", file=sys.stderr)
+                time.sleep(1.5)
+                snapshots = load_snapshots(include_autosaves=include_autosaves)
+                continue
+            snapshots = load_snapshots(include_autosaves=include_autosaves)
+            print(f"renamed {result.item.name} to {renamed.name}", file=sys.stderr)
+            continue
+        if result.action == "delete" and result.item:
+            delete_snapshot(result.item)
+            snapshots = load_snapshots(include_autosaves=include_autosaves)
+            print(f"deleted {result.item.name}", file=sys.stderr)
+            if not snapshots:
+                return None
+
+
+def _open_snapshot(item: StoredSnapshot) -> None:
+    session_path = session.write_session(item.path)
+    session.open_session(session_path)
+    print(f"opened {item.name}")
+
+
+def cmd_reopen(args: argparse.Namespace) -> int:
+    if args.name == "*":
+        snapshots = [item for item in load_snapshots(include_autosaves=False) if item.kind == "named"]
+        if not snapshots:
+            raise CommandError("No named workspaces found")
+        for item in reversed(snapshots):
+            _open_snapshot(item)
+        return 0
+
+    include_autosaves = not args.no_autosaves
+    item = _match_snapshot(args.name, include_autosaves=include_autosaves) if args.name else _pick_snapshot(include_autosaves)
+    if not item:
+        raise CommandError("No matching workspace found")
+    _open_snapshot(item)
+    return 0
+
+
+def cmd_rename(args: argparse.Namespace) -> int:
+    item = _match_snapshot(args.old_name, include_autosaves=True)
+    if not item:
+        raise CommandError("No matching workspace found")
+    renamed = rename_snapshot(item, args.new_name)
+    print(renamed.path)
+    return 0
+
+
+def cmd_delete(args: argparse.Namespace) -> int:
+    item = _match_snapshot(args.name, include_autosaves=True)
+    if not item:
+        raise CommandError("No matching workspace found")
+    delete_snapshot(item)
+    print(f"deleted {item.name}")
+    return 0
+
+
+def _autosave_name(os_window: dict) -> str:
+    digest_source = json.dumps(os_window, sort_keys=True, default=str).encode("utf-8")
+    digest = hashlib.sha1(digest_source).hexdigest()[:8]
+    return f"{slugify(window_title(os_window))}-{os_window.get('id', 'window')}-{timestamp()}-{digest}"
+
+
+def cmd_daemon(args: argparse.Namespace) -> int:
+    seen: dict[int, str] = {}
+    last_error = ""
+    last_error_at = 0.0
+    print("ktr daemon: watching kitty multi-tab OS windows")
+    while True:
+        try:
+            os_windows = kitty.ls()
+            last_error = ""
+            for os_window in os_windows:
+                if tab_count(os_window) < args.min_tabs:
+                    continue
+                comparable = json.dumps(os_window, sort_keys=True, default=str)
+                digest = hashlib.sha1(comparable.encode("utf-8")).hexdigest()
+                os_id = int(os_window.get("id") or 0)
+                if seen.get(os_id) == digest:
+                    continue
+                seen[os_id] = digest
+                path = save_os_window(
+                    os_window,
+                    _autosave_name(os_window),
+                    kind="autosave",
+                    capture_scrollback=not args.no_scrollback,
+                )
+                print(path, flush=True)
+                prune_autosaves(args.keep_autosaves)
+        except CommandError as exc:
+            now = time.monotonic()
+            message = str(exc)
+            if message != last_error or now - last_error_at >= args.error_interval:
+                print(f"ktr daemon: {exc}", file=sys.stderr, flush=True)
+                last_error = message
+                last_error_at = now
+        time.sleep(args.interval)
+
+
+def cmd_killactive(args: argparse.Namespace) -> int:
+    active = hyprland.active_window()
+    if not hyprland.is_kitty_window(active):
+        hyprland.killactive()
+        return 0
+
+    os_windows = kitty.ls()
+    os_window = choose_focused_os_window(os_windows, active)
+    if not os_window:
+        hyprland.killactive()
+        return 0
+
+    tabs = tab_count(os_window)
+    if tabs < 2:
+        hyprland.killactive()
+        return 0
+
+    autosave_path = save_os_window(os_window, _autosave_name(os_window), kind="autosave", capture_scrollback=True)
+    action = popup.choose_close_action(
+        f"This kitty window has {tabs} tabs.\n\nAn autosave has been written:\n{autosave_path}"
+    )
+    if action == "cancel":
+        return 0
+    if action == "save-as":
+        name = popup.ask_name(window_title(os_window))
+        if not name:
+            return 0
+        save_os_window(os_window, name, kind="named", capture_scrollback=True)
+    hyprland.killactive()
+    return 0
+
+
+def cmd_completions(args: argparse.Namespace) -> int:
+    if args.shell == "zsh":
+        print(
+            """#compdef ktr reopen
+_ktr_workspaces() {
+  local -a names
+  names=(${(f)"$(ktr list --autosaves 2>/dev/null | awk '{print $1}')"})
+  _describe 'workspaces' names
+}
+
+case "$service" in
+  reopen) _ktr_workspaces ;;
+  ktr)
+    local -a commands
+    commands=(save list reopen rename delete daemon killactive completions)
+    if (( CURRENT == 2 )); then
+      _describe 'commands' commands
+    elif [[ ${words[2]} == reopen ]]; then
+      _ktr_workspaces
+    fi
+    ;;
+esac"""
+        )
+        return 0
+    if args.shell == "bash":
+        print(
+            """_ktr_complete() {
+  local cur="${COMP_WORDS[COMP_CWORD]}"
+  local names="$(ktr list --autosaves 2>/dev/null | awk '{print $1}')"
+  COMPREPLY=( $(compgen -W "$names" -- "$cur") )
+}
+complete -F _ktr_complete reopen"""
+        )
+        return 0
+    if args.shell == "fish":
+        print("complete -c reopen -a '(ktr list --autosaves 2>/dev/null | awk \"{print \\$1}\")'")
+        return 0
+    raise CommandError(f"Unsupported shell: {args.shell}")
+
+
+def build_parser(prog: str = "ktr") -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog=prog)
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    save = sub.add_parser("save")
+    save.add_argument("name", nargs="?")
+    save.add_argument("--all", action="store_true")
+    save.add_argument("--no-scrollback", action="store_true")
+    save.set_defaults(func=cmd_save)
+
+    list_cmd = sub.add_parser("list")
+    list_cmd.add_argument("--autosaves", action="store_true")
+    list_cmd.set_defaults(func=cmd_list)
+
+    reopen = sub.add_parser("reopen")
+    reopen.add_argument("name", nargs="?")
+    reopen.add_argument("--no-autosaves", action="store_true")
+    reopen.set_defaults(func=cmd_reopen)
+
+    rename = sub.add_parser("rename")
+    rename.add_argument("old_name")
+    rename.add_argument("new_name")
+    rename.set_defaults(func=cmd_rename)
+
+    delete = sub.add_parser("delete")
+    delete.add_argument("name")
+    delete.set_defaults(func=cmd_delete)
+
+    daemon = sub.add_parser("daemon")
+    daemon.add_argument("--interval", type=float, default=5.0)
+    daemon.add_argument("--error-interval", type=float, default=60.0)
+    daemon.add_argument("--min-tabs", type=int, default=2)
+    daemon.add_argument("--keep-autosaves", type=int, default=50)
+    daemon.add_argument("--no-scrollback", action="store_true")
+    daemon.set_defaults(func=cmd_daemon)
+
+    killactive = sub.add_parser("killactive")
+    killactive.set_defaults(func=cmd_killactive)
+
+    completions = sub.add_parser("completions")
+    completions.add_argument("shell", choices=["zsh", "bash", "fish"])
+    completions.set_defaults(func=cmd_completions)
+
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        return args.func(args)
+    except (CommandError, KeyboardInterrupt) as exc:
+        return _print_error(exc)
+
+
+def reopen_main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="reopen")
+    parser.add_argument("name", nargs="?")
+    parser.add_argument("--no-autosaves", action="store_true")
+    args = parser.parse_args(argv)
+    try:
+        return cmd_reopen(args)
+    except (CommandError, KeyboardInterrupt) as exc:
+        return _print_error(exc)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

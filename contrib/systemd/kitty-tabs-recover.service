@@ -1,0 +1,12 @@
+[Unit]
+Description=Autosave multi-tab kitty windows
+Documentation=https://github.com/Chester-Booth/kitty-tabs-recover
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/ktr daemon
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=default.target
