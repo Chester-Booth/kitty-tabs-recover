@@ -16,6 +16,10 @@ def _quote(value: str) -> str:
     return shlex.quote(value)
 
 
+def _session_value(value: str) -> str:
+    return value.replace("\n", " ").strip()
+
+
 _ANSI_RE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x1b]*(?:\x07|\x1b\\)|\\)")
 
 
@@ -177,15 +181,15 @@ def render_session(snapshot: dict[str, Any], *, snapshot_root: Path | None = Non
     if snapshot_root:
         _prepare_restore_files(snapshot, snapshot_root)
     if os_title:
-        lines.append(f"os_window_title {_quote(str(os_title))}")
+        lines.append(f"os_window_title {_session_value(str(os_title))}")
 
     for tab_index, tab in enumerate(snapshot.get("os_window", {}).get("tabs") or []):
         title = str(tab.get("title") or f"Tab {tab_index + 1}")
-        lines.append(f"new_tab {_quote(title)}")
+        lines.append(f"new_tab {_session_value(title)}")
 
         layout = tab.get("layout")
         if layout:
-            lines.append(f"layout {_quote(str(layout))}")
+            lines.append(f"layout {_session_value(str(layout))}")
 
         windows = tab.get("windows") or []
         if not windows:

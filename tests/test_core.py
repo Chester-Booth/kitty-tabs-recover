@@ -109,6 +109,22 @@ class CoreTests(unittest.TestCase):
             self.assertIn(": ", (root / "history/tab-001-window-001.zsh_history").read_text())
             self.assertIn("focus_tab 1", rendered)
 
+    def test_render_session_does_not_quote_tab_titles_with_spaces(self) -> None:
+        snapshot = sample_snapshot("Project")
+        snapshot["os_window"]["title"] = "learn guide"
+        snapshot["os_window"]["tabs"][0]["title"] = "cd learn"
+        snapshot["os_window"]["tabs"][0]["windows"][0]["title"] = "cd learn"
+        snapshot["os_window"]["tabs"][1]["title"] = "cd small"
+        snapshot["os_window"]["tabs"][1]["windows"][0]["title"] = "cd small"
+
+        rendered = render_session(snapshot)
+
+        self.assertIn("os_window_title learn guide", rendered)
+        self.assertIn("new_tab cd learn", rendered)
+        self.assertIn("new_tab cd small", rendered)
+        self.assertNotIn("new_tab 'cd learn'", rendered)
+        self.assertNotIn("new_tab 'cd small'", rendered)
+
     def test_restore_scrollback_trims_empty_p10k_prompt(self) -> None:
         raw = "output\n\x1b[38:5:242m╭─ fancy prompt\n\x1b[38:5:242m╰─ battery\n"
         self.assertEqual(_trim_trailing_prompt(raw), "output\n")
