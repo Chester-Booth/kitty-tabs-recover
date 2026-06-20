@@ -28,6 +28,14 @@ def killactive() -> None:
     run(["hyprctl", "dispatch", "killactive"])
 
 
+def close_window(address: str | None) -> None:
+    require_binary("hyprctl")
+    if address:
+        run(["hyprctl", "dispatch", "closewindow", f"address:{address}"])
+        return
+    killactive()
+
+
 def is_kitty_window(window: dict[str, Any] | None) -> bool:
     if not window:
         return False

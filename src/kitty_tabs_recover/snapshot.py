@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import shutil
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -59,13 +60,20 @@ def choose_focused_os_window(os_windows: list[dict[str, Any]], hypr_window: dict
     return None
 
 
-def build_snapshot(os_window: dict[str, Any], *, name: str, kind: str, capture_scrollback: bool = True) -> dict[str, Any]:
+def build_snapshot(
+    os_window: dict[str, Any],
+    *,
+    name: str,
+    kind: str,
+    capture_scrollback: bool = True,
+    kitty_target: str | None = None,
+) -> dict[str, Any]:
     tabs: list[dict[str, Any]] = []
     for tab_index, tab in enumerate(os_window.get("tabs") or []):
         windows: list[dict[str, Any]] = []
         for window_index, window in enumerate(tab.get("windows") or []):
             window_id = int(window.get("id") or 0)
-            scrollback = kitty.get_scrollback(window_id) if capture_scrollback and window_id else ""
+            scrollback = kitty.get_scrollback(window_id, target=kitty_target) if capture_scrollback and window_id else ""
             windows.append(
                 {
                     "index": window_index,
@@ -129,6 +137,37 @@ def write_snapshot(snapshot: dict[str, Any]) -> Path:
     path = target / "snapshot.json"
     path.write_text(json.dumps(snapshot, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return path
+
+
+def _parse_timestamp(value: str) -> datetime | None:
+    try:
+        return datetime.strptime(value, "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+def _autosave_identity(data: dict[str, Any]) -> tuple[Any, str]:
+    os_window = data.get("os_window") or {}
+    return os_window.get("id"), str(os_window.get("title") or "")
+
+
+def mark_autosave_ephemeral(snapshot_path: Path, *, keep_days: int = 7) -> Path:
+    """Keep only this autosave for its source window, and expire it later."""
+    data = json.loads(snapshot_path.read_text(encoding="utf-8"))
+    if data.get("kind") != "autosave":
+        return snapshot_path
+
+    expiry = datetime.now(timezone.utc) + timedelta(days=keep_days)
+    data["expires_at"] = expiry.strftime("%Y%m%dT%H%M%SZ")
+    snapshot_path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    identity = _autosave_identity(data)
+    for item in load_snapshots(include_autosaves=True):
+        if item.kind != "autosave" or item.path == snapshot_path:
+            continue
+        if _autosave_identity(item.data) == identity:
+            delete_snapshot(item)
+    return snapshot_path
 
 
 def load_snapshots(*, include_autosaves: bool = True) -> list[StoredSnapshot]:
@@ -221,6 +260,26 @@ def prune_autosaves(keep: int) -> None:
             pass
 
 
-def save_os_window(os_window: dict[str, Any], name: str, *, kind: str = "named", capture_scrollback: bool = True) -> Path:
-    snapshot = build_snapshot(os_window, name=name, kind=kind, capture_scrollback=capture_scrollback)
+def prune_expired_autosaves() -> None:
+    now = datetime.now(timezone.utc)
+    for item in load_snapshots(include_autosaves=True):
+        if item.kind != "autosave":
+            continue
+        expires_at = str(item.data.get("expires_at") or "")
+        if not expires_at:
+            continue
+        expiry = _parse_timestamp(expires_at)
+        if expiry and expiry <= now:
+            delete_snapshot(item)
+
+
+def save_os_window(
+    os_window: dict[str, Any],
+    name: str,
+    *,
+    kind: str = "named",
+    capture_scrollback: bool = True,
+    kitty_target: str | None = None,
+) -> Path:
+    snapshot = build_snapshot(os_window, name=name, kind=kind, capture_scrollback=capture_scrollback, kitty_target=kitty_target)
     return write_snapshot(snapshot)

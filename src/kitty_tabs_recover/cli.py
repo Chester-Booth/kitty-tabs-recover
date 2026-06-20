@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import argparse
 import difflib
+import fcntl
 import hashlib
 import json
+import os
 import sys
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 from . import hyprland, kitty, popup, session, tui
@@ -17,7 +20,9 @@ from .snapshot import (
     current_workspace_key,
     delete_snapshot,
     load_snapshots,
+    mark_autosave_ephemeral,
     prune_autosaves,
+    prune_expired_autosaves,
     rename_snapshot,
     save_os_window,
     tab_count,
@@ -52,7 +57,7 @@ def cmd_save(args: argparse.Namespace) -> int:
     os_windows = kitty.ls()
     if args.all:
         for os_window in os_windows:
-            if tab_count(os_window) < 1:
+            if tab_count(os_window) < 2:
                 continue
             name = args.name or window_title(os_window)
             if len(os_windows) > 1:
@@ -167,6 +172,37 @@ def _autosave_name(os_window: dict) -> str:
     return f"{slugify(window_title(os_window))}-{os_window.get('id', 'window')}-{timestamp()}-{digest}"
 
 
+def _workspace_name_from_window(os_window: dict) -> str | None:
+    for tab in os_window.get("tabs") or []:
+        for window in tab.get("windows") or []:
+            user_vars = window.get("user_vars") or {}
+            env = window.get("env") or {}
+            kind = str(user_vars.get("ktr_workspace_kind") or env.get("KTR_WORKSPACE_KIND") or "")
+            name = str(user_vars.get("ktr_workspace_name") or env.get("KTR_WORKSPACE_NAME") or "")
+            if kind == "named" and name:
+                return name
+    return None
+
+
+@contextmanager
+def _single_killactive_run():
+    path = "/tmp/kitty-tabs-recover-killactive.lock"
+    fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            yield False
+            return
+        yield True
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        os.close(fd)
+
+
 def cmd_daemon(args: argparse.Namespace) -> int:
     seen: dict[int, str] = {}
     last_error = ""
@@ -192,6 +228,7 @@ def cmd_daemon(args: argparse.Namespace) -> int:
                     capture_scrollback=not args.no_scrollback,
                 )
                 print(path, flush=True)
+                prune_expired_autosaves()
                 prune_autosaves(args.keep_autosaves)
         except CommandError as exc:
             now = time.monotonic()
@@ -204,34 +241,53 @@ def cmd_daemon(args: argparse.Namespace) -> int:
 
 
 def cmd_killactive(args: argparse.Namespace) -> int:
+    with _single_killactive_run() as should_run:
+        if not should_run:
+            return 0
+        return _cmd_killactive_locked(args)
+
+
+def _cmd_killactive_locked(args: argparse.Namespace) -> int:
     active = hyprland.active_window()
+    active_address = str(active.get("address") or "") if active else ""
     if not hyprland.is_kitty_window(active):
-        hyprland.killactive()
+        hyprland.close_window(active_address)
         return 0
 
-    os_windows = kitty.ls()
+    kitty_target = kitty.target_for_pid(active.get("pid") if active else None)
+    os_windows = kitty.ls(target=kitty_target)
     os_window = choose_focused_os_window(os_windows, active)
     if not os_window:
-        hyprland.killactive()
+        hyprland.close_window(active_address)
         return 0
 
     tabs = tab_count(os_window)
     if tabs < 2:
-        hyprland.killactive()
+        hyprland.close_window(active_address)
         return 0
 
-    autosave_path = save_os_window(os_window, _autosave_name(os_window), kind="autosave", capture_scrollback=True)
+    workspace_name = _workspace_name_from_window(os_window)
+    if workspace_name:
+        save_os_window(os_window, workspace_name, kind="named", capture_scrollback=True, kitty_target=kitty_target)
+        hyprland.close_window(active_address)
+        return 0
+
     action = popup.choose_close_action(
-        f"This kitty window has {tabs} tabs.\n\nAn autosave has been written:\n{autosave_path}"
+        f"This unnamed kitty window has {tabs} tabs.\n\nSave it as a named workspace before closing?"
     )
     if action == "cancel":
+        return 0
+    if action == "dont-save":
+        autosave_path = save_os_window(os_window, _autosave_name(os_window), kind="autosave", capture_scrollback=True, kitty_target=kitty_target)
+        mark_autosave_ephemeral(autosave_path, keep_days=7)
+        hyprland.close_window(active_address)
         return 0
     if action == "save-as":
         name = popup.ask_name(window_title(os_window))
         if not name:
             return 0
-        save_os_window(os_window, name, kind="named", capture_scrollback=True)
-    hyprland.killactive()
+        save_os_window(os_window, name, kind="named", capture_scrollback=True, kitty_target=kitty_target)
+    hyprland.close_window(active_address)
     return 0
 
 

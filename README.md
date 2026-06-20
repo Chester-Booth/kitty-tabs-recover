@@ -55,13 +55,20 @@ In the `reopen` TUI:
 
 - type to filter
 - up/down moves selection
-- left/right changes the filter between all, saved and archived recovery entries
+- Tab or Shift+Tab switches focus between the Filter and Sort controls
+- left/right changes the focused Filter or Sort control
+- Filter switches between all, saved and recovery entries
+- Sort switches between updated and created time
+- `ctrl+a` expands or collapses the autosave history for the selected window; by default only the latest autosave per window is shown
 - Enter reopens the selected workspace
 - `ctrl+r` renames the selected workspace; renaming an autosave promotes it to a saved workspace
 - Esc or Ctrl+C cancels an in-progress rename
 - `ctrl+d` deletes the selected workspace
+- Esc or Ctrl+C cancels an in-progress delete confirmation
 - `ctrl+g` jumps back to the current workspace when `reopen` is launched from a restored workspace
 - Esc or Ctrl+C cancels
+
+In this UI, recovery entries are autosaved recovery snapshots. They are not a separate workspace type: saved workspaces persist until you delete them, while autosaves are temporary recovery entries governed by the autosave retention policy.
 
 From the repository checkout, the wrapper scripts work without installing a wheel:
 

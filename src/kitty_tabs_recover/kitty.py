@@ -18,6 +18,15 @@ def _socket_candidates() -> list[str]:
     return candidates
 
 
+def target_for_pid(pid: int | str | None) -> str | None:
+    if not pid:
+        return None
+    path = Path(f"/tmp/kitty-tabs-recover-{pid}")
+    if path.exists():
+        return f"unix:{path}"
+    return None
+
+
 def kitten_base(target: str | None = None) -> list[str]:
     require_binary("kitten")
     argv = ["kitten", "@"]
@@ -26,9 +35,9 @@ def kitten_base(target: str | None = None) -> list[str]:
     return argv
 
 
-def ls() -> list[dict[str, Any]]:
+def ls(target: str | None = None) -> list[dict[str, Any]]:
     errors: list[str] = []
-    candidates = _socket_candidates()
+    candidates = [target] if target else _socket_candidates()
     if not candidates:
         candidates = [""]
 
@@ -53,8 +62,8 @@ def ls() -> list[dict[str, Any]]:
     return data
 
 
-def get_scrollback(window_id: int) -> str:
-    candidates = _socket_candidates() or [""]
+def get_scrollback(window_id: int, *, target: str | None = None) -> str:
+    candidates = ([target] if target else _socket_candidates()) or [""]
     for target in candidates:
         result = run(
             [
@@ -64,6 +73,7 @@ def get_scrollback(window_id: int) -> str:
                 f"id:{window_id}",
                 "--extent",
                 "all",
+                "--ansi",
             ],
             check=False,
         )
