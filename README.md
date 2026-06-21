@@ -15,7 +15,7 @@ For close confirmation without replacing your global Hyprland close binding, use
 confirm_os_window_close 2
 ```
 
-For a richer optional Hyprland flow with `Cancel`, `Close` and `Save As`, replace your close bind with:
+For a richer optional Hyprland-only flow with `Cancel`, `Close` and `Save As`, replace your close bind with:
 
 ```conf
 bind = $mainMod, Q, exec, ktr killactive
@@ -47,7 +47,7 @@ reopen project
 reopen '*'
 ktr rename old-name new-name
 ktr delete name
-ktr daemon
+ktr daemon [--keep-autosaves 50] [--keep-autosaves-per-window 5]
 ktr completions zsh
 ```
 
@@ -103,4 +103,4 @@ Snapshots are stored below:
 
 ## Limits
 
-This restores tabs, tab order, titles, working directories and saved scrollback text. It does not resurrect live processes. Shell history is preserved by your shell's normal history mechanism.
+This restores tabs, tab order, titles, working directories and saved scrollback text. It does not restore exact pane geometry or resurrect live processes. Shell history is preserved by your shell's normal history mechanism, with additional best-effort zsh history seeding from saved scrollback.

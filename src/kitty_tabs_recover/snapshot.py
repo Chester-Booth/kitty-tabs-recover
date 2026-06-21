@@ -1,7 +1,12 @@
 from __future__ import annotations
 
+import copy
+import fcntl
 import json
+import os
 import shutil
+import tempfile
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -10,7 +15,7 @@ from typing import Any
 from . import kitty
 from .commands import CommandError
 from .names import slugify, timestamp
-from .paths import autosaves_dir, ensure_dirs, workspaces_dir
+from .paths import autosaves_dir, data_dir, ensure_dirs, workspaces_dir
 
 
 @dataclass(frozen=True)
@@ -117,8 +122,32 @@ def _snapshot_dir(name: str, kind: str) -> Path:
     return root / slugify(name)
 
 
-def write_snapshot(snapshot: dict[str, Any]) -> Path:
+@contextmanager
+def _storage_lock():
     ensure_dirs()
+    path = data_dir() / ".lock"
+    fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, delete=False) as tmp:
+        tmp.write(text)
+        tmp.flush()
+        os.fsync(tmp.fileno())
+        tmp_path = Path(tmp.name)
+    os.replace(tmp_path, path)
+
+
+def _write_snapshot_unlocked(snapshot: dict[str, Any]) -> Path:
     name = str(snapshot["name"])
     kind = str(snapshot.get("kind") or "named")
     target = _snapshot_dir(name, kind)
@@ -130,13 +159,17 @@ def write_snapshot(snapshot: dict[str, Any]) -> Path:
             if scrollback:
                 rel = f"scrollback/tab-{tab['index'] + 1:03d}-window-{window['index'] + 1:03d}.txt"
                 scrollback_path = target / rel
-                scrollback_path.parent.mkdir(parents=True, exist_ok=True)
-                scrollback_path.write_text(scrollback, encoding="utf-8")
+                _atomic_write_text(scrollback_path, scrollback)
                 window["scrollback_file"] = rel
 
     path = target / "snapshot.json"
-    path.write_text(json.dumps(snapshot, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    _atomic_write_text(path, json.dumps(snapshot, indent=2, sort_keys=True) + "\n")
     return path
+
+
+def write_snapshot(snapshot: dict[str, Any]) -> Path:
+    with _storage_lock():
+        return _write_snapshot_unlocked(copy.deepcopy(snapshot))
 
 
 def _parse_timestamp(value: str) -> datetime | None:
@@ -153,21 +186,22 @@ def _autosave_identity(data: dict[str, Any]) -> tuple[Any, str]:
 
 def mark_autosave_ephemeral(snapshot_path: Path, *, keep_days: int = 7) -> Path:
     """Keep only this autosave for its source window, and expire it later."""
-    data = json.loads(snapshot_path.read_text(encoding="utf-8"))
-    if data.get("kind") != "autosave":
+    with _storage_lock():
+        data = json.loads(snapshot_path.read_text(encoding="utf-8"))
+        if data.get("kind") != "autosave":
+            return snapshot_path
+
+        expiry = datetime.now(timezone.utc) + timedelta(days=keep_days)
+        data["expires_at"] = expiry.strftime("%Y%m%dT%H%M%SZ")
+        _atomic_write_text(snapshot_path, json.dumps(data, indent=2, sort_keys=True) + "\n")
+
+        identity = _autosave_identity(data)
+        for item in load_snapshots(include_autosaves=True):
+            if item.kind != "autosave" or item.path == snapshot_path:
+                continue
+            if _autosave_identity(item.data) == identity:
+                _delete_snapshot_unlocked(item)
         return snapshot_path
-
-    expiry = datetime.now(timezone.utc) + timedelta(days=keep_days)
-    data["expires_at"] = expiry.strftime("%Y%m%dT%H%M%SZ")
-    snapshot_path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-
-    identity = _autosave_identity(data)
-    for item in load_snapshots(include_autosaves=True):
-        if item.kind != "autosave" or item.path == snapshot_path:
-            continue
-        if _autosave_identity(item.data) == identity:
-            delete_snapshot(item)
-    return snapshot_path
 
 
 def load_snapshots(*, include_autosaves: bool = True) -> list[StoredSnapshot]:
@@ -205,72 +239,81 @@ def reload_snapshot(path: Path, kind: str) -> StoredSnapshot:
 
 
 def rename_snapshot(item: StoredSnapshot, new_name: str) -> StoredSnapshot:
-    ensure_dirs()
-    new_name = new_name.strip()
-    if not new_name:
-        raise CommandError("Workspace name cannot be empty")
+    with _storage_lock():
+        new_name = new_name.strip()
+        if not new_name:
+            raise CommandError("Workspace name cannot be empty")
 
-    new_kind = "named"
-    target = _snapshot_dir(new_name, new_kind)
-    if target.exists() and target.resolve() != item.path.parent.resolve():
-        raise CommandError(f"Workspace already exists: {new_name}")
+        new_kind = "named"
+        target = _snapshot_dir(new_name, new_kind)
+        if target.exists() and target.resolve() != item.path.parent.resolve():
+            raise CommandError(f"Workspace already exists: {new_name}")
 
-    source = item.path.parent
-    data = dict(item.data)
-    data["name"] = new_name
-    data["kind"] = new_kind
-    data["updated_at"] = timestamp()
+        source = item.path.parent
+        data = dict(item.data)
+        data["name"] = new_name
+        data["kind"] = new_kind
+        data["updated_at"] = timestamp()
 
-    if source.resolve() != target.resolve():
-        target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.move(str(source), str(target))
+        if source.resolve() != target.resolve():
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(source), str(target))
 
-    path = target / "snapshot.json"
-    path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    session_path = target / "session.kitty"
-    if session_path.exists():
-        session_path.unlink()
-    return StoredSnapshot(new_name, new_kind, path, data)
+        path = target / "snapshot.json"
+        _atomic_write_text(path, json.dumps(data, indent=2, sort_keys=True) + "\n")
+        session_path = target / "session.kitty"
+        if session_path.exists():
+            session_path.unlink()
+        return StoredSnapshot(new_name, new_kind, path, data)
 
 
 def delete_snapshot(item: StoredSnapshot) -> None:
+    with _storage_lock():
+        _delete_snapshot_unlocked(item)
+
+
+def _delete_snapshot_unlocked(item: StoredSnapshot) -> None:
     root = item.path.parent
     if not root.exists():
         return
     shutil.rmtree(root)
 
 
-def prune_autosaves(keep: int) -> None:
+def prune_autosaves(keep: int, *, per_window: int = 5) -> None:
     if keep < 1:
         return
-    autosaves = [item for item in load_snapshots(include_autosaves=True) if item.kind == "autosave"]
-    for item in autosaves[keep:]:
-        root = item.path.parent
-        for child in sorted(root.rglob("*"), reverse=True):
-            if child.is_file():
-                child.unlink(missing_ok=True)
-            elif child.is_dir():
-                try:
-                    child.rmdir()
-                except OSError:
-                    pass
-        try:
-            root.rmdir()
-        except OSError:
-            pass
+    with _storage_lock():
+        autosaves = [item for item in load_snapshots(include_autosaves=True) if item.kind == "autosave"]
+        to_delete: list[StoredSnapshot] = []
+        if per_window > 0:
+            by_window: dict[tuple[Any, str], list[StoredSnapshot]] = {}
+            for item in autosaves:
+                by_window.setdefault(_autosave_identity(item.data), []).append(item)
+            for items in by_window.values():
+                to_delete.extend(items[per_window:])
+
+        kept = [item for item in autosaves if item not in to_delete]
+        to_delete.extend(kept[keep:])
+        seen_paths: set[Path] = set()
+        for item in to_delete:
+            if item.path in seen_paths:
+                continue
+            seen_paths.add(item.path)
+            _delete_snapshot_unlocked(item)
 
 
 def prune_expired_autosaves() -> None:
-    now = datetime.now(timezone.utc)
-    for item in load_snapshots(include_autosaves=True):
-        if item.kind != "autosave":
-            continue
-        expires_at = str(item.data.get("expires_at") or "")
-        if not expires_at:
-            continue
-        expiry = _parse_timestamp(expires_at)
-        if expiry and expiry <= now:
-            delete_snapshot(item)
+    with _storage_lock():
+        now = datetime.now(timezone.utc)
+        for item in load_snapshots(include_autosaves=True):
+            if item.kind != "autosave":
+                continue
+            expires_at = str(item.data.get("expires_at") or "")
+            if not expires_at:
+                continue
+            expiry = _parse_timestamp(expires_at)
+            if expiry and expiry <= now:
+                _delete_snapshot_unlocked(item)
 
 
 def save_os_window(

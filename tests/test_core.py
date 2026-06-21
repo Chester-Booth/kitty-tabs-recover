@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import argparse
 import curses
 import tempfile
 import unittest
@@ -9,6 +10,7 @@ from pathlib import Path
 from unittest import mock
 
 from kitty_tabs_recover import kitty
+from kitty_tabs_recover.cli import _match_snapshot, build_parser
 from kitty_tabs_recover.names import slugify
 from kitty_tabs_recover.session import _history_commands, _restore_message, _trim_trailing_prompt, render_session
 from kitty_tabs_recover.snapshot import current_workspace_key, delete_snapshot, load_snapshots, mark_autosave_ephemeral, prune_autosaves, rename_snapshot, write_snapshot
@@ -86,12 +88,28 @@ class CoreTests(unittest.TestCase):
     def test_write_snapshot_splits_scrollback(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             with mock.patch.dict(os.environ, {"XDG_DATA_HOME": tmp}):
-                path = write_snapshot(sample_snapshot())
+                snapshot = sample_snapshot()
+                path = write_snapshot(snapshot)
                 data = json.loads(path.read_text(encoding="utf-8"))
                 self.assertEqual(data["name"], "Project")
                 scrollback = path.parent / "scrollback/tab-001-window-001.txt"
                 self.assertEqual(scrollback.read_text(encoding="utf-8"), "hello\n")
                 self.assertEqual(data["os_window"]["tabs"][0]["windows"][0]["scrollback_file"], "scrollback/tab-001-window-001.txt")
+                self.assertEqual(snapshot["os_window"]["tabs"][0]["windows"][0]["scrollback"], "hello\n")
+
+    def test_write_snapshot_replaces_existing_json_atomically(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.dict(os.environ, {"XDG_DATA_HOME": tmp}):
+                first = sample_snapshot("Project")
+                first["updated_at"] = "2026-06-08T00:00:00Z"
+                path = write_snapshot(first)
+
+                second = sample_snapshot("Project")
+                second["updated_at"] = "2026-06-08T00:01:00Z"
+                write_snapshot(second)
+
+                data = json.loads(path.read_text(encoding="utf-8"))
+                self.assertEqual(data["updated_at"], "2026-06-08T00:01:00Z")
 
     def test_render_session(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -160,6 +178,42 @@ class CoreTests(unittest.TestCase):
                 snapshots = load_snapshots(include_autosaves=True)
                 self.assertEqual([item.name for item in snapshots if item.kind == "autosave"], ["auto-2"])
 
+    def test_prune_autosaves_keeps_per_window_history(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.dict(os.environ, {"XDG_DATA_HOME": tmp}):
+                for window_id in (7, 8):
+                    for index in range(3):
+                        snapshot = sample_snapshot(f"auto-{window_id}-{index}")
+                        snapshot["kind"] = "autosave"
+                        snapshot["updated_at"] = f"2026-06-08T00:0{index}:0{window_id}Z"
+                        snapshot["os_window"]["id"] = window_id
+                        snapshot["os_window"]["title"] = f"window-{window_id}"
+                        write_snapshot(snapshot)
+
+                prune_autosaves(10, per_window=2)
+
+                autosaves = [item for item in load_snapshots(include_autosaves=True) if item.kind == "autosave"]
+                self.assertEqual(
+                    sorted(item.name for item in autosaves),
+                    ["auto-7-1", "auto-7-2", "auto-8-1", "auto-8-2"],
+                )
+
+    def test_prune_autosaves_still_applies_global_cap(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.dict(os.environ, {"XDG_DATA_HOME": tmp}):
+                for index in range(4):
+                    snapshot = sample_snapshot(f"auto-{index}")
+                    snapshot["kind"] = "autosave"
+                    snapshot["updated_at"] = f"2026-06-08T00:00:0{index}Z"
+                    snapshot["os_window"]["id"] = index
+                    snapshot["os_window"]["title"] = f"window-{index}"
+                    write_snapshot(snapshot)
+
+                prune_autosaves(2, per_window=5)
+
+                autosaves = [item for item in load_snapshots(include_autosaves=True) if item.kind == "autosave"]
+                self.assertEqual([item.name for item in autosaves], ["auto-3", "auto-2"])
+
     def test_mark_autosave_ephemeral_keeps_latest_for_window(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             with mock.patch.dict(os.environ, {"XDG_DATA_HOME": tmp}):
@@ -197,6 +251,56 @@ class CoreTests(unittest.TestCase):
 
                 delete_snapshot(renamed)
                 self.assertFalse(renamed.path.parent.exists())
+
+    def test_match_snapshot_prefers_named_over_autosave(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.dict(os.environ, {"XDG_DATA_HOME": tmp}):
+                saved = sample_snapshot("Project")
+                saved["kind"] = "named"
+                saved["updated_at"] = "2026-06-08T00:00:00Z"
+                write_snapshot(saved)
+
+                auto = sample_snapshot("Project")
+                auto["kind"] = "autosave"
+                auto["updated_at"] = "2026-06-08T00:01:00Z"
+                write_snapshot(auto)
+
+                matched = _match_snapshot("project", include_autosaves=True)
+                self.assertIsNotNone(matched)
+                self.assertEqual(matched.kind, "named")
+
+    def test_match_snapshot_can_still_match_autosave_when_no_named_match(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.dict(os.environ, {"XDG_DATA_HOME": tmp}):
+                auto = sample_snapshot("Project")
+                auto["kind"] = "autosave"
+                write_snapshot(auto)
+
+                matched = _match_snapshot("project", include_autosaves=True)
+                self.assertIsNotNone(matched)
+                self.assertEqual(matched.kind, "autosave")
+
+    def test_daemon_parser_exposes_per_window_autosave_retention(self) -> None:
+        args = build_parser().parse_args(["daemon", "--keep-autosaves", "20", "--keep-autosaves-per-window", "3"])
+        self.assertEqual(args.keep_autosaves, 20)
+        self.assertEqual(args.keep_autosaves_per_window, 3)
+
+    def test_help_explains_top_level_commands(self) -> None:
+        help_text = build_parser().format_help()
+
+        self.assertIn("Save, autosave, list and reopen", help_text)
+        self.assertIn("save the focused kitty OS window", help_text)
+        self.assertIn("Hyprland close helper", help_text)
+
+    def test_daemon_help_explains_options(self) -> None:
+        parser = build_parser()
+        daemon = next(action for action in parser._actions if isinstance(action, argparse._SubParsersAction)).choices["daemon"]
+        help_text = daemon.format_help()
+
+        self.assertIn("--keep-autosaves", help_text)
+        self.assertIn("global autosave cap", help_text)
+        self.assertIn("--keep-autosaves-per-window", help_text)
+        self.assertIn("autosave cap per source window", help_text)
 
     def test_current_workspace_key(self) -> None:
         with mock.patch.dict(os.environ, {"KTR_WORKSPACE_NAME": "Project", "KTR_WORKSPACE_KIND": "named"}):

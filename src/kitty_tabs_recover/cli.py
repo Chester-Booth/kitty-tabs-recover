@@ -76,23 +76,26 @@ def cmd_save(args: argparse.Namespace) -> int:
 
 def _match_snapshot(query: str, *, include_autosaves: bool = True) -> StoredSnapshot | None:
     snapshots = load_snapshots(include_autosaves=include_autosaves)
-    named = [item for item in snapshots if include_autosaves or item.kind == "named"]
-    if not named:
+    candidates = snapshots if include_autosaves else [item for item in snapshots if item.kind == "named"]
+    if not candidates:
         return None
 
     query_slug = slugify(query)
-    for item in named:
-        if item.name == query or slugify(item.name) == query_slug:
-            return item
+    named = [item for item in candidates if item.kind == "named"]
+    autosaves = [item for item in candidates if item.kind == "autosave"]
+    for scope in (named, autosaves):
+        for item in scope:
+            if item.name == query or slugify(item.name) == query_slug:
+                return item
 
-    prefix = [item for item in named if slugify(item.name).startswith(query_slug)]
+    prefix = [item for item in candidates if slugify(item.name).startswith(query_slug)]
     if len(prefix) == 1:
         return prefix[0]
 
-    names = [item.name for item in named]
+    names = [item.name for item in candidates]
     matches = difflib.get_close_matches(query, names, n=2, cutoff=0.45)
     if len(matches) == 1:
-        return next(item for item in named if item.name == matches[0])
+        return next(item for item in candidates if item.name == matches[0])
     return None
 
 
@@ -229,7 +232,7 @@ def cmd_daemon(args: argparse.Namespace) -> int:
                 )
                 print(path, flush=True)
                 prune_expired_autosaves()
-                prune_autosaves(args.keep_autosaves)
+                prune_autosaves(args.keep_autosaves, per_window=args.keep_autosaves_per_window)
         except CommandError as exc:
             now = time.monotonic()
             message = str(exc)
@@ -332,46 +335,54 @@ complete -F _ktr_complete reopen"""
 
 
 def build_parser(prog: str = "ktr") -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog=prog)
-    sub = parser.add_subparsers(dest="command", required=True)
+    parser = argparse.ArgumentParser(
+        prog=prog,
+        description="Save, autosave, list and reopen multi-tab kitty workspaces.",
+    )
+    sub = parser.add_subparsers(dest="command", metavar="command", required=True)
 
-    save = sub.add_parser("save")
-    save.add_argument("name", nargs="?")
-    save.add_argument("--all", action="store_true")
-    save.add_argument("--no-scrollback", action="store_true")
+    save = sub.add_parser("save", help="save the focused kitty OS window", description="Save a kitty OS window as a named workspace.")
+    save.add_argument("name", nargs="?", help="workspace name; defaults to the active window title")
+    save.add_argument("--all", action="store_true", help="save every kitty OS window with enough tabs")
+    save.add_argument("--no-scrollback", action="store_true", help="do not capture saved scrollback text")
     save.set_defaults(func=cmd_save)
 
-    list_cmd = sub.add_parser("list")
-    list_cmd.add_argument("--autosaves", action="store_true")
+    list_cmd = sub.add_parser("list", help="list saved workspaces", description="List saved workspaces and, optionally, recovery autosaves.")
+    list_cmd.add_argument("--autosaves", action="store_true", help="include recovery autosaves")
     list_cmd.set_defaults(func=cmd_list)
 
-    reopen = sub.add_parser("reopen")
-    reopen.add_argument("name", nargs="?")
-    reopen.add_argument("--no-autosaves", action="store_true")
+    reopen = sub.add_parser("reopen", help="reopen a workspace", description="Reopen a workspace by name, or show the picker when no name is given.")
+    reopen.add_argument("name", nargs="?", help="workspace name, '*' for all saved workspaces, or omit for the picker")
+    reopen.add_argument("--no-autosaves", action="store_true", help="only match saved workspaces")
     reopen.set_defaults(func=cmd_reopen)
 
-    rename = sub.add_parser("rename")
-    rename.add_argument("old_name")
-    rename.add_argument("new_name")
+    rename = sub.add_parser("rename", help="rename a workspace", description="Rename a saved workspace, or promote an autosave by renaming it.")
+    rename.add_argument("old_name", help="existing workspace name")
+    rename.add_argument("new_name", help="new saved workspace name")
     rename.set_defaults(func=cmd_rename)
 
-    delete = sub.add_parser("delete")
-    delete.add_argument("name")
+    delete = sub.add_parser("delete", help="delete a workspace", description="Delete a saved workspace or recovery autosave.")
+    delete.add_argument("name", help="workspace name")
     delete.set_defaults(func=cmd_delete)
 
-    daemon = sub.add_parser("daemon")
-    daemon.add_argument("--interval", type=float, default=5.0)
-    daemon.add_argument("--error-interval", type=float, default=60.0)
-    daemon.add_argument("--min-tabs", type=int, default=2)
-    daemon.add_argument("--keep-autosaves", type=int, default=50)
-    daemon.add_argument("--no-scrollback", action="store_true")
+    daemon = sub.add_parser("daemon", help="autosave multi-tab kitty windows", description="Watch kitty and autosave OS windows with multiple tabs.")
+    daemon.add_argument("--interval", type=float, default=5.0, help="seconds between kitty polls; default: %(default)s")
+    daemon.add_argument("--error-interval", type=float, default=60.0, help="minimum seconds between repeated error logs; default: %(default)s")
+    daemon.add_argument("--min-tabs", type=int, default=2, help="minimum tab count before autosaving; default: %(default)s")
+    daemon.add_argument("--keep-autosaves", type=int, default=50, help="global autosave cap; default: %(default)s")
+    daemon.add_argument("--keep-autosaves-per-window", type=int, default=5, help="autosave cap per source window; default: %(default)s")
+    daemon.add_argument("--no-scrollback", action="store_true", help="do not capture saved scrollback text")
     daemon.set_defaults(func=cmd_daemon)
 
-    killactive = sub.add_parser("killactive")
+    killactive = sub.add_parser(
+        "killactive",
+        help="Hyprland close helper with save prompt",
+        description="Hyprland-only close helper: prompt before closing unnamed multi-tab kitty windows.",
+    )
     killactive.set_defaults(func=cmd_killactive)
 
-    completions = sub.add_parser("completions")
-    completions.add_argument("shell", choices=["zsh", "bash", "fish"])
+    completions = sub.add_parser("completions", help="print shell completions", description="Print shell completion code.")
+    completions.add_argument("shell", choices=["zsh", "bash", "fish"], help="shell to generate completions for")
     completions.set_defaults(func=cmd_completions)
 
     return parser

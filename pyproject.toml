@@ -12,9 +12,17 @@ license = "MIT"
 authors = [{ name = "blox" }]
 dependencies = []
 
+[dependency-groups]
+dev = [
+    "pytest>=8",
+]
+
 [project.scripts]
 ktr = "kitty_tabs_recover.cli:main"
 reopen = "kitty_tabs_recover.cli:reopen_main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/kitty_tabs_recover"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
