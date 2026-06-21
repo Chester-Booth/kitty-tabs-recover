@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import curses
 import tempfile
 import unittest
 from pathlib import Path
@@ -11,7 +12,18 @@ from kitty_tabs_recover import kitty
 from kitty_tabs_recover.names import slugify
 from kitty_tabs_recover.session import _history_commands, _restore_message, _trim_trailing_prompt, render_session
 from kitty_tabs_recover.snapshot import current_workspace_key, delete_snapshot, load_snapshots, mark_autosave_ephemeral, prune_autosaves, rename_snapshot, write_snapshot
-from kitty_tabs_recover.tui import _autosave_key, _display_rows, _visible_items
+from kitty_tabs_recover.tui import _autosave_key, _display_rows, _draw_header, _ellipsise, _footer_segments, _row_for_width, _search_segments, _visible_items
+
+
+class FakeScreen:
+    def __init__(self) -> None:
+        self.calls: list[tuple[int, int, str, int]] = []
+
+    def addnstr(self, y: int, x: int, text: str, _width: int, attr: int = 0) -> None:
+        self.calls.append((y, x, text, attr))
+
+    def line(self, y: int) -> str:
+        return "".join(text for call_y, _x, text, _attr in sorted(self.calls, key=lambda call: call[1]) if call_y == y)
 
 
 def sample_snapshot(name: str = "Project") -> dict:
@@ -233,6 +245,67 @@ class CoreTests(unittest.TestCase):
                 rows = _display_rows(_visible_items(items, "", "all", "updated", None))
                 self.assertEqual(rows[0].kind, "heading")
                 self.assertIn("date", rows[0].label)
+
+    def test_tui_row_truncates_tab_titles_with_ellipsis(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.dict(os.environ, {"XDG_DATA_HOME": tmp}):
+                snapshot = sample_snapshot("long-tabs")
+                snapshot["os_window"]["tabs"][0]["title"] = "a very long api tab title"
+                snapshot["os_window"]["tabs"][1]["title"] = "a very long web tab title"
+                write_snapshot(snapshot)
+                item = load_snapshots(include_autosaves=True)[0]
+
+                row = _row_for_width(item, 72, is_current=False)
+
+                self.assertLessEqual(len(row), 71)
+                self.assertTrue(row.endswith("..."))
+
+    def test_tui_footer_hides_purposes_before_keys_when_narrow(self) -> None:
+        with mock.patch("curses.has_colors", return_value=False):
+            wide = "".join(text for text, _attr in _footer_segments(140))
+            narrow = "".join(text for text, _attr in _footer_segments(40))
+
+        self.assertIn("reopen", wide)
+        self.assertIn("focus filter/sort", wide)
+        self.assertNotIn("reopen", narrow)
+        self.assertNotIn("focus filter/sort", narrow)
+        self.assertIn("enter", narrow)
+        self.assertIn("tab", narrow)
+
+    def test_tui_ellipsise_handles_tiny_widths(self) -> None:
+        self.assertEqual(_ellipsise("abcdef", 0), "")
+        self.assertEqual(_ellipsise("abcdef", 2), "..")
+        self.assertEqual(_ellipsise("abcdef", 5), "ab...")
+
+    def test_tui_header_keeps_search_and_controls_on_one_row_when_they_fit(self) -> None:
+        screen = FakeScreen()
+
+        with mock.patch("curses.has_colors", return_value=False):
+            list_top = _draw_header(screen, 120, "", "all", "updated", "filter", None)
+
+        self.assertEqual(list_top, 4)
+        self.assertIn("Type to search", screen.line(2))
+        self.assertIn("Filter:", screen.line(2))
+        self.assertNotIn("Filter:", screen.line(3))
+
+    def test_tui_header_wraps_controls_when_search_row_is_too_narrow(self) -> None:
+        screen = FakeScreen()
+
+        with mock.patch("curses.has_colors", return_value=False):
+            list_top = _draw_header(screen, 45, "", "all", "updated", "filter", None)
+
+        self.assertEqual(list_top, 5)
+        self.assertIn("Type to search", screen.line(2))
+        self.assertIn("Filter:", screen.line(3))
+
+    def test_tui_search_placeholder_and_active_label_styles(self) -> None:
+        with mock.patch("curses.has_colors", return_value=False):
+            placeholder = _search_segments("")
+            active = _search_segments("api")
+
+        self.assertEqual(placeholder, [("  ", curses.A_DIM), ("Type to search", curses.A_DIM)])
+        self.assertEqual("".join(text for text, _attr in active), "  Search: api")
+        self.assertNotEqual(active[1][1], curses.A_DIM)
 
 
 if __name__ == "__main__":

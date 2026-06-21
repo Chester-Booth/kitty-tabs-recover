@@ -18,6 +18,10 @@ ESC = "\x1b"
 FILTER_MODES = ("all", "saved", "recovery")
 SORT_MODES = ("updated", "created")
 CONTROLS = ("filter", "sort")
+SEARCH_LABEL = "Search: "
+SEARCH_PLACEHOLDER = "Type to search"
+HEADER_SEARCH_GAP = 3
+ROW_FIXED_WIDTH = len("> ") + len(f"{'now':<9} {'':<1} {'':<28.28} {'1':>4} {'save':<8} ")
 
 
 @dataclass(frozen=True)
@@ -104,6 +108,30 @@ def _row(item: StoredSnapshot, *, is_current: bool, connector: str = "") -> str:
     return f"{date:<9} {connector:<1} {name:<28.28} {tabs:>4} {type_label:<8} {tab_titles}{current}"
 
 
+def _row_for_width(item: StoredSnapshot, width: int, *, is_current: bool, connector: str = "", selected: bool = False) -> str:
+    available = max(0, width - 1)
+    prefix = "> " if selected else "  "
+    date, name, tabs, type_label, tab_titles = _row_fields(item)
+    current = " current" if is_current else ""
+    detail = f"{tab_titles}{current}"
+    detail_width = max(0, available - ROW_FIXED_WIDTH)
+    if detail_width:
+        detail = _ellipsise(detail, detail_width)
+    else:
+        detail = ""
+    return f"{prefix}{date:<9} {connector:<1} {name:<28.28} {tabs:>4} {type_label:<8} {detail}"[:available]
+
+
+def _ellipsise(text: str, width: int) -> str:
+    if width <= 0:
+        return ""
+    if len(text) <= width:
+        return text
+    if width <= 3:
+        return "." * width
+    return text[: width - 3].rstrip() + "..."
+
+
 def pick_snapshot(snapshots: Iterable[StoredSnapshot], *, current_key: tuple[str, str] | None = None) -> TuiResult:
     items = list(snapshots)
     if not items:
@@ -132,7 +160,7 @@ def _fallback(items: list[StoredSnapshot], current_key: tuple[str, str] | None) 
 def _run(stdscr: curses.window, items: list[StoredSnapshot], current_key: tuple[str, str] | None) -> TuiResult:
     try:
         curses.set_escdelay(25)
-        curses.curs_set(1)
+        curses.curs_set(0)
         curses.raw()
     except curses.error:
         pass
@@ -161,9 +189,8 @@ def _run(stdscr: curses.window, items: list[StoredSnapshot], current_key: tuple[
 
         stdscr.erase()
         height, width = stdscr.getmaxyx()
-        _draw_header(stdscr, width, query, filter_mode, sort_mode, active_control, expanded_autosave_key)
+        list_top = _draw_header(stdscr, width, query, filter_mode, sort_mode, active_control, expanded_autosave_key)
 
-        list_top = 5
         list_height = max(1, height - list_top - 3)
         selected_item = visible_items[selected] if visible_items else None
         visible_items = _visible_items(items, query, filter_mode, sort_mode, expanded_autosave_key)
@@ -188,12 +215,11 @@ def _run(stdscr: curses.window, items: list[StoredSnapshot], current_key: tuple[
             item_selected = absolute_index == selected_display_index
             is_current = _is_current(item, current_key)
             attr = _row_attr(item_selected, is_current, row_index)
-            prefix = "> " if item_selected else "  "
             connector = _autosave_connector(item, expanded_autosave_key)
-            stdscr.addnstr(y, 0, prefix + _row(item, is_current=is_current, connector=connector), width - 1, attr)
+            stdscr.addnstr(y, 0, _row_for_width(item, width, is_current=is_current, connector=connector, selected=item_selected), width - 1, attr)
 
         _draw_footer(stdscr, height, width, selected, len(visible_items), len(items), status_message)
-        stdscr.move(2, min(width - 1, len("Type to search  ") + len(query)))
+        _hide_cursor()
         stdscr.refresh()
 
         key = _read_key(stdscr)
@@ -396,20 +422,34 @@ def _draw_header(
     sort_mode: str,
     active_control: str,
     expanded_autosave_key: tuple[object, str] | None,
-) -> None:
+) -> int:
     stdscr.addnstr(0, 0, "Resume a kitty workspace", width - 1, _colour(1) | curses.A_BOLD)
-    stdscr.addnstr(2, 0, "Type to search  ", width - 1, curses.A_BOLD)
-    stdscr.addnstr(2, len("Type to search  "), query, max(0, width - len("Type to search  ") - 1))
-    right_segments = [
+    control_segments = [
         ("Filter: ", curses.A_DIM),
         *_control_segments(FILTER_MODES, filter_mode, active_control == "filter"),
         ("    Sort: ", curses.A_DIM),
         *_control_segments(SORT_MODES, sort_mode, active_control == "sort"),
     ]
     if expanded_autosave_key is not None:
-        right_segments.extend([("    Autosaves: ", curses.A_DIM), ("[Window]", _colour(4) | curses.A_BOLD)])
-    right = "".join(text for text, _attr in right_segments)
-    _draw_segments(stdscr, 2, max(0, width - len(right) - 1), right_segments, width)
+        control_segments.extend([("    Autosaves: ", curses.A_DIM), ("[Window]", _colour(4) | curses.A_BOLD)])
+    search_segments = _search_segments(query)
+    search_width = sum(len(text) for text, _attr in search_segments)
+    controls_width = sum(len(text) for text, _attr in control_segments)
+    controls_x = max(0, width - controls_width - 1)
+    controls_fit_on_search_row = search_width + HEADER_SEARCH_GAP <= controls_x
+
+    _draw_segments(stdscr, 2, 0, search_segments, width)
+    if controls_fit_on_search_row:
+        _draw_segments(stdscr, 2, controls_x, control_segments, width)
+        return 4
+    _draw_segments(stdscr, 3, 0, control_segments, width)
+    return 5
+
+
+def _search_segments(query: str) -> list[tuple[str, int]]:
+    if not query:
+        return [("  ", curses.A_DIM), (SEARCH_PLACEHOLDER, curses.A_DIM)]
+    return [("  ", curses.A_DIM), (SEARCH_LABEL, _colour(4) | curses.A_BOLD), (query, _colour(4))]
 
 
 def _control_segments(options: tuple[str, ...], active: str, focused: bool) -> list[tuple[str, int]]:
@@ -442,34 +482,48 @@ def _draw_footer(stdscr: curses.window, height: int, width: int, selected: int, 
     y = height - 2
     status = f"{selected + 1 if count else 0} / {count} of {total}"
     divider_width = max(0, width - 1)
-    divider = f" {status} "
+    divider = f" {_ellipsise(status, max(0, divider_width - 2))} " if divider_width >= 3 else _ellipsise(status, divider_width)
     if divider_width > len(divider):
         divider = "─" * (divider_width - len(divider) - 1) + divider + "─"
     stdscr.addnstr(y - 1, 0, divider, divider_width, curses.A_DIM)
-    _draw_segments(stdscr, y, 0, _footer_segments(), width)
+    _draw_segments(stdscr, y, 0, _footer_segments(width), width)
     if status_message:
         stdscr.addnstr(y + 1 if y + 1 < height else y, 0, status_message, width - 1, _colour(2))
 
 
-def _footer_segments() -> list[tuple[str, int]]:
+def _footer_segments(width: int) -> list[tuple[str, int]]:
     key = _colour(4)
     action = curses.A_DIM
-    return [
-        ("enter", key),
-        (" reopen   ", action),
-        ("tab", key),
-        (" focus filter/sort   ", action),
-        ("←/→", key),
-        (" change   ", action),
-        ("ctrl+a", key),
-        (" recovery for row   ", action),
-        ("ctrl+r", key),
-        (" rename   ", action),
-        ("ctrl+d", key),
-        (" delete   ", action),
-        ("esc", key),
-        (" cancel", action),
+    bindings = [
+        ("enter", "reopen"),
+        ("tab", "focus filter/sort"),
+        ("←/→", "change"),
+        ("ctrl+a", "recovery for row"),
+        ("ctrl+r", "rename"),
+        ("ctrl+d", "delete"),
+        ("esc", "cancel"),
     ]
+    key_segments = [(key_text if index == 0 else f"   {key_text}", key) for index, (key_text, _purpose) in enumerate(bindings)]
+    key_width = sum(len(text) for text, _attr in key_segments)
+    segments: list[tuple[str, int]] = []
+    remaining = max(0, width - 1)
+    for index, (key_text, purpose) in enumerate(bindings):
+        key_segment = key_text if index == 0 else f"   {key_text}"
+        purpose_segment = f" {purpose}"
+        later_key_width = sum(len(text) for text, _attr in key_segments[index + 1 :])
+        needed_with_purpose = len(key_segment) + len(purpose_segment) + later_key_width
+        if key_width <= max(0, width - 1) and needed_with_purpose <= remaining:
+            segments.extend([(key_segment, key), (purpose_segment, action)])
+            remaining -= len(key_segment) + len(purpose_segment)
+            key_width -= len(key_segment)
+            continue
+        if len(key_segment) <= remaining:
+            segments.append((key_segment, key))
+            remaining -= len(key_segment)
+            key_width -= len(key_segment)
+        else:
+            break
+    return segments
 
 
 def _colour(pair: int) -> int:
@@ -483,6 +537,13 @@ def _read_key(stdscr: curses.window) -> object:
         return stdscr.get_wch()
     except KeyboardInterrupt:
         return "\x03"
+
+
+def _hide_cursor() -> None:
+    try:
+        curses.curs_set(0)
+    except curses.error:
+        pass
 
 
 def _row_attr(selected: bool, current: bool, row_index: int) -> int:
