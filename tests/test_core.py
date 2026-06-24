@@ -9,7 +9,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from kitty_tabs_recover import kitty
+from kitty_tabs_recover import hyprland, kitty
 from kitty_tabs_recover.cli import _match_snapshot, build_parser
 from kitty_tabs_recover.names import slugify
 from kitty_tabs_recover.session import _history_commands, _restore_message, _trim_trailing_prompt, render_session
@@ -319,6 +319,34 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(kitty.get_scrollback(12), "\x1b[31mred\x1b[0m\n")
 
         self.assertIn("--ansi", calls[0])
+
+    def test_hyprland_killactive_uses_lua_window_close_dispatcher(self) -> None:
+        calls = []
+
+        def fake_run(argv, *, check=True, input_text=None):
+            calls.append(argv)
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        with mock.patch("kitty_tabs_recover.hyprland.require_binary", return_value="hyprctl"), mock.patch(
+            "kitty_tabs_recover.hyprland.run", side_effect=fake_run
+        ):
+            hyprland.killactive()
+
+        self.assertEqual(calls, [["hyprctl", "dispatch", "hl.dsp.window.close()"]])
+
+    def test_hyprland_close_window_targets_address_with_lua_dispatcher(self) -> None:
+        calls = []
+
+        def fake_run(argv, *, check=True, input_text=None):
+            calls.append(argv)
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        with mock.patch("kitty_tabs_recover.hyprland.require_binary", return_value="hyprctl"), mock.patch(
+            "kitty_tabs_recover.hyprland.run", side_effect=fake_run
+        ):
+            hyprland.close_window("0xabc")
+
+        self.assertEqual(calls, [["hyprctl", "dispatch", 'hl.dsp.window.close("address:0xabc")']])
 
     def test_tui_filters_and_latest_autosaves(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

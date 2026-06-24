@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from .commands import CommandError, require_binary, run, run_json
@@ -25,13 +26,14 @@ def active_window() -> dict[str, Any] | None:
 
 def killactive() -> None:
     require_binary("hyprctl")
-    run(["hyprctl", "dispatch", "killactive"])
+    run(["hyprctl", "dispatch", "hl.dsp.window.close()"])
 
 
 def close_window(address: str | None) -> None:
     require_binary("hyprctl")
     if address:
-        run(["hyprctl", "dispatch", "closewindow", f"address:{address}"])
+        selector = json.dumps(f"address:{address}")
+        run(["hyprctl", "dispatch", f"hl.dsp.window.close({selector})"])
         return
     killactive()
 
